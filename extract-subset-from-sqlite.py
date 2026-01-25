@@ -1,77 +1,25 @@
-import os
-import json
 import sqlite3
+import json
+import os
 from pathlib import Path
-from typing import Iterable, List, Optional
-
 from tqdm import tqdm
 
 
-def extract_coco_subset_from_db(
-    db_path: Path,
-    base_output_dir: Path,
-    image_path: Path,
-    patch_number: int,
-    split_name: str = "train",
-    target_category_names: Optional[Iterable[str]] = None,
-    target_category_ids: Optional[Iterable[int]] = None,
-):
-    """
-    Extract a COCO-style subset JSON from a SQLite DB,
-    filtered by existing image files and optional target categories.
-
-    Args:
-        db_path: Path to SQLite DB file
-        base_output_dir: Base output directory
-        image_path: Directory containing target images
-        patch_number: Patch index for output file naming
-        split_name: train/val/test
-        target_category_names: Optional list of category names
-        target_category_ids: Optional list of category ids
-    """
-
-    db_path = Path(db_path)
-    base_output_dir = Path(base_output_dir)
-    image_path = Path(image_path)
-
-    if not db_path.exists():
-        raise FileNotFoundError(f"Cannot find the database file: {db_path}")
-
-    if not image_path.is_dir():
-        raise NotADirectoryError(f"Cannot find the image folder: {image_path}")
-
-    target_images = set(os.listdir(image_path))
-
-    filtered_image_info: List[dict] = []
-    filtered_image_ids: List[int] = []
-
-    conn = sqlite3.connect(str(db_path))
-    cursor = conn.cursor()
-
-    category_name_to_id = {}
+def load_category_mapping(cursor):
+    mapping = {}
     cursor.execute("SELECT id, name FROM categories")
     for cat_id, name in cursor:
-        category_name_to_id[name] = cat_id
+        mapping[name] = cat_id
+    return mapping
 
-    if target_category_names:
-        resolved_ids = []
-        for name in target_category_names:
-            if name not in category_name_to_id:
-                print(f"[WARN] Category name not found in DB: {name}")
-                continue
-            resolved_ids.append(category_name_to_id[name])
 
-        target_category_ids = resolved_ids
-
-    if target_category_ids:
-        target_category_ids = list(set(target_category_ids))
+def fetch_filtered_images(cursor, image_path: Path):
+    target_images = set(os.listdir(image_path))
+    images = []
+    image_ids = []
 
     cursor.execute(
-        """
-        SELECT id, file_name, width, height, license,
-               flickr_url, coco_url, date_captured
-        FROM images
-        """
+        "SELECT id, file_name, width, height, license, flickr_url, coco_url, date_captured FROM images"
     )
 
     for row in tqdm(cursor, desc="Filter DB Images"):
@@ -87,10 +35,9 @@ def extract_coco_subset_from_db(
         ) = row
 
         file_name = Path(file_path).name
-
         if file_name in target_images:
-            filtered_image_ids.append(img_id)
-            filtered_image_info.append(
+            image_ids.append(img_id)
+            images.append(
                 {
                     "id": img_id,
                     "file_name": file_name,
@@ -103,24 +50,24 @@ def extract_coco_subset_from_db(
                 }
             )
 
-    if not filtered_image_ids:
-        conn.close()
-        raise RuntimeError(f"Cannot find any images in {image_path} from the database")
+    return images, image_ids
 
-    filtered_annotations: List[dict] = []
-    chunk_size = 1000
+
+def fetch_filtered_annotations(
+    cursor, image_ids, target_category_ids=None, chunk_size=1000
+):
+    annotations = []
 
     for i in tqdm(
-        range(0, len(filtered_image_ids), chunk_size),
+        range(0, len(image_ids), chunk_size),
         desc="Filter DB annotations",
     ):
-        chunk_ids = filtered_image_ids[i : i + chunk_size]
+        chunk_ids = image_ids[i : i + chunk_size]
         image_placeholders = ",".join("?" * len(chunk_ids))
 
         params = list(chunk_ids)
         sql = f"""
-            SELECT id, image_id, category_id,
-                   bbox, area, iscrowd, segmentation
+            SELECT id, image_id, category_id, bbox, area, iscrowd, segmentation
             FROM annotations
             WHERE image_id IN ({image_placeholders})
         """
@@ -132,60 +79,117 @@ def extract_coco_subset_from_db(
 
         cursor.execute(sql, params)
 
-        for row in cursor:
-            ann_id, image_id, category_id, bbox, area, iscrowd, segmentation = row
-
-            try:
-                bbox_parsed = json.loads(bbox)
-            except Exception:
-                bbox_parsed = []
-
-            try:
-                segmentation_parsed = json.loads(segmentation)
-            except Exception:
-                segmentation_parsed = []
-
-            filtered_annotations.append(
+        for ann_id, image_id, category_id, bbox, area, iscrowd, segmentation in cursor:
+            annotations.append(
                 {
                     "id": ann_id,
                     "image_id": image_id,
                     "category_id": category_id,
-                    "bbox": bbox_parsed,
+                    "bbox": json.loads(bbox),
                     "area": area,
                     "iscrowd": iscrowd,
-                    "segmentation": segmentation_parsed,
+                    "segmentation": json.loads(segmentation),
                 }
             )
 
-    processed_categories: List[dict] = []
+    return annotations
+
+
+def fetch_filtered_categories(cursor, target_category_ids=None):
+    categories = []
     cursor.execute("SELECT id, name, supercategory FROM categories")
 
     for cat_id, name, supercategory in cursor:
         if not target_category_ids or cat_id in target_category_ids:
-            processed_categories.append(
-                {
-                    "id": cat_id,
-                    "name": name,
-                    "supercategory": supercategory,
-                }
+            categories.append(
+                {"id": cat_id, "name": name, "supercategory": supercategory}
             )
 
-    conn.close()
+    return categories
 
-    new_coco_data = {
-        "images": filtered_image_info,
-        "annotations": filtered_annotations,
-        "categories": processed_categories,
+
+def build_coco_json(images, annotations, categories):
+    return {
+        "images": images,
+        "annotations": annotations,
+        "categories": categories,
         "info": {"description": "Filtered COCO dataset from DB"},
-        "licenses": [],
+        "license": [],
     }
 
-    output_dir = base_output_dir / split_name
+
+def save_coco_json(coco_data, output_dir: Path, patch_number, split_name):
+    output_dir = output_dir / split_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_json = output_dir / f"patch_{patch_number}.json"
-
     with open(output_json, "w", encoding="utf-8") as f:
-        json.dump(new_coco_data, f, indent=4, ensure_ascii=False)
+        json.dump(coco_data, f, indent=4, ensure_ascii=False)
 
     print(f"[OK] Saved: {output_json}")
+
+
+def extract_coco_subset_from_db(
+    db_path: Path,
+    base_output_dir: Path,
+    image_path: Path,
+    patch_number: int,
+    split_name="train",
+    target_category_names=None,
+    target_category_ids=None,
+):
+    if not db_path.exists():
+        raise FileNotFoundError(f"DB not found: {db_path}")
+    if not image_path.is_dir():
+        raise FileNotFoundError(f"Image dir not found: {image_path}")
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    category_name_to_id = load_category_mapping(cursor)
+
+    if target_category_names:
+        target_category_ids = [
+            category_name_to_id[name]
+            for name in target_category_names
+            if name in category_name_to_id
+        ]
+
+    images, image_ids = fetch_filtered_images(cursor, image_path)
+    if not image_ids:
+        conn.close()
+        raise RuntimeError(f"No matching images found in {image_path}")
+
+    annotations = fetch_filtered_annotations(cursor, image_ids, target_category_ids)
+    categories = fetch_filtered_categories(cursor, target_category_ids)
+
+    conn.close()
+
+    coco_data = build_coco_json(images, annotations, categories)
+    save_coco_json(coco_data, base_output_dir, patch_number, split_name)
+
+
+def main():
+    db_root = Path("/path/to/db/root")
+    db_path = db_root / "train" / "objects365_train.db"
+
+    patch_number = 25
+    image_path = db_root / "train" / f"patch_{patch_number}" / "images"
+
+    target_category_names = [
+        "person",
+        "car",
+    ]
+
+    extract_coco_subset_from_db(
+        db_path=db_path,
+        base_output_dir=db_root,
+        image_path=image_path,
+        patch_number=patch_number,
+        split_name="train",
+        target_category_names=target_category_names,
+    )
+
+
+if __name__ == "__main__":
+    main()
